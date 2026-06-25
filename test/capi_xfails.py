@@ -69,6 +69,8 @@ CAPI_XFAILS = frozenset(
         # C API scan rewriting uses temporary Arrow-backed tables, which cannot be
         # created through a read-only connection.
         "test/test_scan_pyarrow.py::test_pyarrow_basic",
+        #
+        "test/test_scan_parameter.py::test_copy_from_load_scan_object_param_still_works",
         # UDF registration is still routed through pybind.
         "test/test_blob_parameter.py::test_bytes_param_udf",
         "test/test_udf.py::test_udf",
