@@ -483,7 +483,7 @@ class Connection:
             return
 
         scope = {**caller.f_globals, **caller.f_locals}
-        value = scope.get(var_name, None)
+        value = scope.get(var_name)
 
         if value is None or Connection._is_python_scan_object(value):
             return
@@ -504,10 +504,10 @@ class Connection:
     @staticmethod
     def _unsupported_scan_object_parameter_message(key: str, value: Any) -> str:
         return (
-            f"Binder exception: Attempted to scan from unsupported python type "
-            f"{type(value).__name__}. Can only scan from pandas/polars dataframes and"
-            f" pyarrow tables."
-        )
+            f"Binder exception: Unsupported parameter type {type(value).__name__} "
+            f"for parameter ${key}. Pandas / polars DataFrames and PyArrow "
+            "Tables can only be used as LOAD FROM / COPY FROM scan sources."
+    )
 
     @staticmethod
     def _capi_prepared_scan_parameter_message() -> str:
