@@ -32,6 +32,7 @@ class PreparedStatement:
             parameters = {}
         self._prepared_statement = connection._connection.prepare(query, parameters)
         self._connection = connection
+        self._scan_parameter_names = connection._scan_parameter_names(query)
 
     def is_success(self) -> bool:
         """

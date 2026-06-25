@@ -245,17 +245,17 @@ class Connection:
 
         return normalized_query, normalized_params
 
-    def _is_python_scan_object(self, value: Any) -> bool:
+    @staticmethod
+    def _is_python_scan_object(value: Any) -> bool:
         module_name = type(value).__module__
         return module_name.startswith(("pandas", "polars", "pyarrow"))
 
-    def _has_scan_pattern(self, query: str) -> bool:
-        stripped = query.lstrip()
-        if not (
-            stripped.upper().startswith("LOAD ") or stripped.upper().startswith("COPY ")
-        ):
-            return False
-        return re.search(r"(?i)\bFROM\b", query) is not None
+    @staticmethod
+    def _has_scan_pattern(query: str) -> bool:
+        matches = re.search(
+            r"^\s*\b(LOAD|COPY)\b.*?\bFROM\b", query, re.IGNORECASE | re.DOTALL
+        )
+        return matches is not None
 
     @staticmethod
     def _quote_identifier(identifier: str) -> str:
@@ -331,7 +331,7 @@ class Connection:
         if self._using_pybind_backend() or not self._has_scan_pattern(query):
             return query, parameters
 
-        for key, value in list(parameters.items()):
+        for key, value in parameters.items():
             if not isinstance(key, str):
                 continue
             match = re.search(rf"(?i)\bFROM\s+(\${re.escape(key)})\b", query)
@@ -340,8 +340,8 @@ class Connection:
             if not self._is_python_scan_object(value):
                 msg = (
                     "Binder exception: Trying to scan from unsupported data type "
-                    "INT8[]. The only parameter types that can be scanned from "
-                    "are pandas/polars dataframes and pyarrow tables."
+                    f"{type(value).__name__}. The only parameter types that can "
+                    "be scanned from are pandas/polars dataframes and pyarrow tables."
                 )
                 raise RuntimeError(msg)
             if self.database.read_only:
@@ -463,9 +463,12 @@ class Connection:
         prepared = py_connection.prepare(query, parameters)
         return py_connection.execute(prepared, parameters)
 
-    def _maybe_raise_scan_unsupported_object(self, query: str) -> None:
+    @staticmethod
+    def _maybe_raise_scan_unsupported_object(query: str) -> None:
         match = re.search(
-            r"\bLOAD\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)\b", query, re.IGNORECASE
+            r"\b(LOAD|COPY)\b.*?\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            query,
+            re.IGNORECASE | re.DOTALL,
         )
         if not match:
             return
@@ -480,19 +483,84 @@ class Connection:
             return
 
         scope = {**caller.f_globals, **caller.f_locals}
-        if var_name not in scope:
+        value = scope.get(var_name, None)
+
+        if value is None or Connection._is_python_scan_object(value):
             return
 
-        value = scope[var_name]
-        module_name = type(value).__module__
-        if module_name.startswith(("pandas", "polars", "pyarrow")):
-            return
-
-        msg = (
-            "Binder exception: Attempted to scan from unsupported python object. "
-            "Can only scan from pandas/polars dataframes and pyarrow tables."
+        raise RuntimeError(
+            Connection._unsupported_scan_object_parameter_message(var_name, value)
         )
-        raise RuntimeError(msg)
+
+    @staticmethod
+    def _scan_parameter_names(query: str) -> set[str]:
+        matches = re.findall(
+            r"\b(LOAD|COPY)\b.*?\bFROM\s+\$([A-Za-z_][A-Za-z0-9_]*)\b",
+            query,
+            re.IGNORECASE | re.DOTALL,
+        )
+        return {match[1] for match in matches}
+
+    @staticmethod
+    def _unsupported_scan_object_parameter_message(key: str, value: Any) -> str:
+        return (
+            f"Binder exception: Attempted to scan from unsupported python type "
+            f"{type(value).__name__}. Can only scan from pandas/polars dataframes and"
+            f" pyarrow tables."
+        )
+
+    @staticmethod
+    def _capi_prepared_scan_parameter_message() -> str:
+        return (
+            "Binder exception: PreparedStatement with Python dataframe/table scan "
+            "parameters is not supported on the C-API backend. Use "
+            "conn.execute(query_string, params) instead."
+        )
+
+    @staticmethod
+    def _prepared_scan_parameter_message(key: str, value: Any) -> str:
+        return (
+            f"Binder exception: Unsupported parameter type {type(value).__name__} "
+            f"for parameter ${key}. This PreparedStatement does not use ${key} "
+            "as a LOAD FROM / COPY FROM scan source."
+        )
+
+    def _maybe_raise_scan_unsupported_args(
+        self,
+        query: str,
+        parameters: dict[str, Any],
+        *,
+        for_prepare: bool = False,
+    ) -> None:
+        scan_parameter_names = self._scan_parameter_names(query)
+        for key, value in parameters.items():
+            if not isinstance(key, str):
+                continue
+            if not self._is_python_scan_object(value):
+                continue
+            if key not in scan_parameter_names:
+                raise RuntimeError(
+                    self._unsupported_scan_object_parameter_message(key, value)
+                )
+            if for_prepare and not self._using_pybind_backend():
+                raise RuntimeError(self._capi_prepared_scan_parameter_message())
+
+    def _maybe_raise_prepared_statement_unsupported_args(
+        self,
+        prepared_statement: PreparedStatement,
+        parameters: dict[str, Any],
+    ) -> None:
+        scan_parameter_names = prepared_statement._scan_parameter_names
+        supports_scan_parameter_execute = self._using_pybind_backend()
+        for key, value in parameters.items():
+            if not isinstance(key, str):
+                continue
+            if not self._is_python_scan_object(value):
+                continue
+            if key not in scan_parameter_names:
+                raise RuntimeError(self._prepared_scan_parameter_message(key, value))
+            if not supports_scan_parameter_execute:
+                raise RuntimeError(self._capi_prepared_scan_parameter_message())
 
     def execute(
         self,
@@ -531,6 +599,11 @@ class Connection:
             query, parameters = self._rewrite_local_scan_object(query, parameters)
             query, parameters = self._rewrite_capi_python_scan(query, parameters)
         scan_tables_to_drop = self._capi_scan_tables - scan_tables_before
+
+        if isinstance(query, str):
+            self._maybe_raise_scan_unsupported_args(query, parameters)
+        else:
+            self._maybe_raise_prepared_statement_unsupported_args(query, parameters)
 
         if (
             not self._using_pybind_backend()
@@ -628,6 +701,9 @@ class Connection:
         The only parameters supported during prepare are dataframes.
         Any remaining parameters will be ignored and should be passed to execute().
         """  # noqa: D401
+        if parameters is None:
+            parameters = {}
+        self._maybe_raise_scan_unsupported_args(query, parameters, for_prepare=True)
         return PreparedStatement(self, query, parameters)
 
     def prepare(
