@@ -507,7 +507,7 @@ class Connection:
             f"Binder exception: Unsupported parameter type {type(value).__name__} "
             f"for parameter ${key}. Pandas / polars DataFrames and PyArrow "
             "Tables can only be used as LOAD FROM / COPY FROM scan sources."
-    )
+        )
 
     @staticmethod
     def _capi_prepared_scan_parameter_message() -> str:
@@ -527,30 +527,18 @@ class Connection:
 
     def _maybe_raise_scan_unsupported_args(
         self,
-        query: str,
+        query: str | PreparedStatement,
         parameters: dict[str, Any],
         *,
         for_prepare: bool = False,
     ) -> None:
-        scan_parameter_names = self._scan_parameter_names(query)
-        for key, value in parameters.items():
-            if not isinstance(key, str):
-                continue
-            if not self._is_python_scan_object(value):
-                continue
-            if key not in scan_parameter_names:
-                raise RuntimeError(
-                    self._unsupported_scan_object_parameter_message(key, value)
-                )
-            if for_prepare and not self._using_pybind_backend():
-                raise RuntimeError(self._capi_prepared_scan_parameter_message())
+        if isinstance(query, str):
+            is_prepared = False
+            scan_parameter_names = self._scan_parameter_names(query)
+        elif isinstance(query, PreparedStatement):
+            is_prepared = True
+            scan_parameter_names = query._scan_parameter_names
 
-    def _maybe_raise_prepared_statement_unsupported_args(
-        self,
-        prepared_statement: PreparedStatement,
-        parameters: dict[str, Any],
-    ) -> None:
-        scan_parameter_names = prepared_statement._scan_parameter_names
         supports_scan_parameter_execute = self._using_pybind_backend()
         for key, value in parameters.items():
             if not isinstance(key, str):
@@ -558,8 +546,15 @@ class Connection:
             if not self._is_python_scan_object(value):
                 continue
             if key not in scan_parameter_names:
-                raise RuntimeError(self._prepared_scan_parameter_message(key, value))
-            if not supports_scan_parameter_execute:
+                if is_prepared:
+                    raise RuntimeError(
+                        self._prepared_scan_parameter_message(key, value)
+                    )
+                else:
+                    raise RuntimeError(
+                        self._unsupported_scan_object_parameter_message(key, value)
+                    )
+            if (for_prepare or is_prepared) and not supports_scan_parameter_execute:
                 raise RuntimeError(self._capi_prepared_scan_parameter_message())
 
     def execute(
@@ -600,10 +595,7 @@ class Connection:
             query, parameters = self._rewrite_capi_python_scan(query, parameters)
         scan_tables_to_drop = self._capi_scan_tables - scan_tables_before
 
-        if isinstance(query, str):
-            self._maybe_raise_scan_unsupported_args(query, parameters)
-        else:
-            self._maybe_raise_prepared_statement_unsupported_args(query, parameters)
+        self._maybe_raise_scan_unsupported_args(query, parameters)
 
         if (
             not self._using_pybind_backend()
